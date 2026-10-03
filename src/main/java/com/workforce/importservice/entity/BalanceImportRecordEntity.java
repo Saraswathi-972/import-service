@@ -34,5 +34,6 @@ public class BalanceImportRecordEntity {
     @Enumerated(EnumType.STRING)
     @Column(name = "import_status", nullable = false)
     private ImportRecordStatus importRecordStatus;
+    @Column(columnDefinition = "TEXT")
     private String errorMessage;
 }

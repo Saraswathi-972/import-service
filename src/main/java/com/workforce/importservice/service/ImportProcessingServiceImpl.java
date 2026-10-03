@@ -1,6 +1,10 @@
 package com.workforce.importservice.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.workforce.importservice.client.EmployeeServiceClient;
 import com.workforce.importservice.dto.BalanceImportRecord;
+import com.workforce.importservice.dto.EmployeeBalanceRequest;
 import com.workforce.importservice.dto.ImportMessage;
 import com.workforce.importservice.entity.BalanceImportRecordEntity;
 import com.workforce.importservice.entity.ImportJob;
@@ -8,6 +12,7 @@ import com.workforce.importservice.entity.ImportRecordStatus;
 import com.workforce.importservice.entity.ImportStatus;
 import com.workforce.importservice.repository.BalanceImportRecordRepository;
 import com.workforce.importservice.repository.ImportJobRepository;
+import feign.FeignException;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
@@ -21,13 +26,17 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
     private final BalanceImportValidator balanceImportValidator;
     private final ImportJobRepository importJobRepository;
     private final BalanceImportRecordRepository balanceImportRecordRepository;
+    private final EmployeeServiceClient employeeServiceClient;
+    private final ObjectMapper objectMapper;
 
-    public ImportProcessingServiceImpl(FileStorageService fileStorageService, CsvParserService csvParserService, BalanceImportValidator balanceImportValidator, ImportJobRepository importJobRepository, BalanceImportRecordRepository balanceImportRecordRepository) {
+    public ImportProcessingServiceImpl(FileStorageService fileStorageService, CsvParserService csvParserService, BalanceImportValidator balanceImportValidator, ImportJobRepository importJobRepository, BalanceImportRecordRepository balanceImportRecordRepository, EmployeeServiceClient employeeServiceClient, ObjectMapper objectMapper) {
         this.fileStorageService = fileStorageService;
         this.csvParserService = csvParserService;
         this.balanceImportValidator = balanceImportValidator;
         this.importJobRepository = importJobRepository;
         this.balanceImportRecordRepository = balanceImportRecordRepository;
+        this.employeeServiceClient=employeeServiceClient;
+        this.objectMapper=objectMapper;
     }
 
     @Override
@@ -35,6 +44,15 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
         System.out.println("Processing import message: " + importMessage);
         ImportJob importJob = importJobRepository.findById(importMessage.getImportId())
                 .orElseThrow(() -> new RuntimeException("Import job not found with ID: " + importMessage.getImportId()));
+
+        if (importJob.getStatus() == ImportStatus.COMPLETED) {
+            System.out.println(
+                    "Import job " + importJob.getId()
+                            + " is already completed. Skipping duplicate message."
+            );
+            return;
+        }
+
         importJob.setStatus(ImportStatus.PROCESSING);
         importJobRepository.save(importJob);
         try (InputStream inputStream = fileStorageService.downloadFile(importMessage.getS3Key())) {
@@ -53,10 +71,62 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
                     failedRecords++;
                     continue;
                 }
+                EmployeeBalanceRequest request = EmployeeBalanceRequest.builder()
+                        .employeeNumber(record.getAaid())
+                        .balanceName(record.getBalanceName())
+                        .balanceValue(record.getBalanceValue())
+                        .action(record.getAction())
+                        .build();
+                try {
+                    employeeServiceClient.processBalance(request);
 
-                BalanceImportRecordEntity entity = buildRecordEntity(record, importJob, ImportRecordStatus.SUCCESS, null);
-                balanceImportRecordRepository.save(entity);
-                successfulRecords++;
+                    BalanceImportRecordEntity entity = buildRecordEntity(record, importJob, ImportRecordStatus.SUCCESS, null);
+                    balanceImportRecordRepository.save(entity);
+                    successfulRecords++;
+                }
+                catch (FeignException e) {
+
+                    String errorMessage;
+                    System.out.println("Feign status: " + e.status());
+                    System.out.println("Feign response body: " + e.contentUTF8());
+
+                    try {
+                        JsonNode root = objectMapper.readTree(e.contentUTF8());
+
+                        if (root.has("message")) {
+                            errorMessage = root.get("message").asText();
+                        } else {
+                            errorMessage = "Employee service returned an error";
+                        }
+
+                    } catch (Exception parseException) {
+
+                        System.out.println(
+                                "Could not parse employee-service error response: "
+                                        + parseException.getMessage()
+                        );
+
+                        errorMessage = "Employee service returned an error";
+                    }
+
+                    System.out.println(
+                            "Error processing balance for AAID "
+                                    + record.getAaid()
+                                    + ": "
+                                    + errorMessage
+                    );
+
+                    BalanceImportRecordEntity entity =
+                            buildRecordEntity(
+                                    record,
+                                    importJob,
+                                    ImportRecordStatus.FAILED,
+                                    errorMessage
+                            );
+
+                    balanceImportRecordRepository.save(entity);
+                    failedRecords++;
+                }
 
                 System.out.println("AAID: " + record.getAaid() +
                         ", BalanceName: " + record.getBalanceName()
@@ -67,6 +137,7 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
 
 
             }
+
             importJob.setTotalRecords(records.size());
             importJob.setSuccessfulRecords(successfulRecords);
             importJob.setFailedRecords(failedRecords);
