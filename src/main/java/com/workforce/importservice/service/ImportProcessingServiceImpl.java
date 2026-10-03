@@ -3,9 +3,7 @@ package com.workforce.importservice.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.workforce.importservice.client.EmployeeServiceClient;
-import com.workforce.importservice.dto.BalanceImportRecord;
-import com.workforce.importservice.dto.EmployeeBalanceRequest;
-import com.workforce.importservice.dto.ImportMessage;
+import com.workforce.importservice.dto.*;
 import com.workforce.importservice.entity.BalanceImportRecordEntity;
 import com.workforce.importservice.entity.ImportJob;
 import com.workforce.importservice.entity.ImportRecordStatus;
@@ -28,8 +26,9 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
     private final BalanceImportRecordRepository balanceImportRecordRepository;
     private final EmployeeServiceClient employeeServiceClient;
     private final ObjectMapper objectMapper;
+    private final EmailNotificationService emailNotificationService;
 
-    public ImportProcessingServiceImpl(FileStorageService fileStorageService, CsvParserService csvParserService, BalanceImportValidator balanceImportValidator, ImportJobRepository importJobRepository, BalanceImportRecordRepository balanceImportRecordRepository, EmployeeServiceClient employeeServiceClient, ObjectMapper objectMapper) {
+    public ImportProcessingServiceImpl(FileStorageService fileStorageService, CsvParserService csvParserService, BalanceImportValidator balanceImportValidator, ImportJobRepository importJobRepository, BalanceImportRecordRepository balanceImportRecordRepository, EmployeeServiceClient employeeServiceClient, ObjectMapper objectMapper, EmailNotificationService emailNotificationService) {
         this.fileStorageService = fileStorageService;
         this.csvParserService = csvParserService;
         this.balanceImportValidator = balanceImportValidator;
@@ -37,6 +36,7 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
         this.balanceImportRecordRepository = balanceImportRecordRepository;
         this.employeeServiceClient=employeeServiceClient;
         this.objectMapper=objectMapper;
+        this.emailNotificationService=emailNotificationService;
     }
 
     @Override
@@ -145,6 +145,39 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
             importJob.setCompletedAt(LocalDateTime.now());
 
             importJobRepository.save(importJob);
+
+            ImportResultResponse result =
+                    ImportResultResponse.builder()
+                            .importId(importJob.getId())
+                            .fileName(importJob.getFileName())
+                            .status(importJob.getStatus())
+                            .totalRecords(importJob.getTotalRecords())
+                            .successfulRecords(importJob.getSuccessfulRecords())
+                            .failedRecords(importJob.getFailedRecords())
+                            .completedAt(importJob.getCompletedAt())
+                            .failedRecordDetails(
+                                    balanceImportRecordRepository
+                                            .findByImportJobIdAndImportRecordStatus(
+                                                    importJob.getId(),
+                                                    ImportRecordStatus.FAILED
+                                            )
+                                            .stream()
+                                            .map(this::mapToFailedRecordResponse)
+                                            .toList()
+                            )
+                            .build();
+            try {
+                emailNotificationService.sendImportResultEmail(result);
+            } catch (Exception e) {
+                System.err.println(
+                        "Failed to send import result email for import ID: "
+                                + importJob.getId()
+                                + ". Import processing was successful."
+                );
+
+                e.printStackTrace();
+            }
+
         } catch (Exception e) {
             importJob.setStatus(ImportStatus.FAILED);
             importJob.setCompletedAt(LocalDateTime.now());
@@ -169,6 +202,21 @@ public class ImportProcessingServiceImpl implements ImportProcessingService {
                 .comments(record.getComments())
                 .importRecordStatus(status)
                 .errorMessage(errorMessage)
+                .build();
+    }
+
+    private FailedRecordResponse mapToFailedRecordResponse(
+            BalanceImportRecordEntity record) {
+
+        return FailedRecordResponse.builder()
+                .aaid(record.getAaid())
+                .balanceName(record.getBalanceName())
+                .action(record.getAction())
+                .balanceValue(record.getBalanceValue())
+                .effectiveDate(record.getEffectiveDate())
+                .comments(record.getComments())
+                .status(record.getImportRecordStatus().name())
+                .errorMessage(record.getErrorMessage())
                 .build();
     }
 }
